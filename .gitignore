@@ -1,0 +1,43 @@
+# Docs and notes
+*.txt
+CLAUDE.md
+.claude/
+
+# Old/example scripts and temp files
+example_*.py
+main_*.py
+.temp_query.py
+
+# Data files (large datasets)
+data/
+cache/
+*.parquet
+*.csv
+*.pt
+*.cbm
+*.npz
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Submissions (large output files)
+submission_boosting/
+submission*.csv
