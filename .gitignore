@@ -5,9 +5,8 @@ CLAUDE.md
 
 # Old/example scripts and temp files
 example_*.py
-#main_*.py
-.temp_query.py
-_*.py
+main_*.py
+.temp_*.py
 _cells/
 
 # Data files (large datasets)
@@ -43,3 +42,6 @@ Thumbs.db
 # Submissions (large output files)
 submission_boosting/
 submission*.csv
+
+catboost_info/
+sol_154/
