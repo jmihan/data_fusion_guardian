@@ -1,0 +1,19 @@
+from pathlib import Path
+import os
+
+# Support DATA_FUSION_DATA env var, fallback to data/raw
+DATA_DIR = Path(os.environ.get("DATA_FUSION_DATA", "data/raw"))
+SOL154_CACHE_DIR = Path("cache/sol154")
+SOL154_SOLUTION1_CACHE = SOL154_CACHE_DIR / "solution1"
+SOL154_COLES_CACHE = SOL154_CACHE_DIR / "coles"
+SOL154_SOLUTION1_SUBMISSIONS = SOL154_CACHE_DIR / "solution1_submissions"
+SOL154_SOLUTION2_RESULTS = SOL154_CACHE_DIR / "solution2"
+SOL154_PIPELINE1ST_CACHE = SOL154_CACHE_DIR / "pipeline1st"
+SOL154_AGI_DIR = SOL154_CACHE_DIR / "agi"
+SOL154_INTERMEDIATES = Path("src/sol154/intermediates")
+
+# Create dirs
+for d in [SOL154_CACHE_DIR, SOL154_SOLUTION1_CACHE, SOL154_COLES_CACHE,
+          SOL154_SOLUTION1_SUBMISSIONS, SOL154_SOLUTION2_RESULTS,
+          SOL154_PIPELINE1ST_CACHE, SOL154_AGI_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
