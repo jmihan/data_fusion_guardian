@@ -21,27 +21,10 @@ import xgboost as xgb
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
-
-from prepare_data import prepare_data as _run_prepare_data
-from train_last_n_pooling import (
-    MultiTaskTwoBranchMultiWindowModel,
-    SequenceSegmentDataset,
-    collate_segments,
-    load_and_preprocess,
-    build_encoded_store,
-    build_segments,
-    train_one_epoch,
-    predict_loader_all,
-    ModelConfig,
-    SequenceStore,
-    EncodedSequenceStore,
-    set_seed,
-    encode_with_unk,
-    compute_ap_metrics,
-    BASE_CAT_COLS as NN_BASE_CAT_COLS,
-    BASE_NUM_COLS as NN_BASE_NUM_COLS,
-)
+from torch.utils.data import DataLoader, TensorDataset
+import joblib
+from sklearn.ensemble import ExtraTreesClassifier
+from sklearn.preprocessing import StandardScaler
 
 pl.Config.set_tbl_rows(12)
 pl.Config.set_tbl_cols(200)
@@ -72,23 +55,16 @@ USE_GPU = True
 TRAIN_CB = True
 TRAIN_LGB = True
 TRAIN_XGB = True
-TRAIN_NN = True
+TRAIN_ET = True
+TRAIN_MLP = True
 
 RETRAIN_ON_FULL_CB = True
 RETRAIN_ON_FULL_LGB = True
 RETRAIN_ON_FULL_XGB = True
-RETRAIN_ON_FULL_NN = True
+RETRAIN_ON_FULL_ET = True
+RETRAIN_ON_FULL_MLP = True
 
 BLEND_METHOD = "nelder-mead"  # "nelder-mead", "grid-search", "diff-evolution"
-
-NN_LAST_N = 64        # 128→64: halves pair_mask [B,T,T] quadratically, ~4× faster per batch
-NN_HIDDEN_DIM = 256
-NN_EVENT_DIM = 64     # 128→64: halves VRAM for pooling tensors
-NN_MAX_EPOCHS = 8
-NN_PATIENCE = 3
-NN_LR = 3e-4          # 1e-3→3e-4: safer with LayerNorm, prevents gradient explosion
-NN_BATCH_SIZE = 512
-NN_DROPOUT = 0.15
 
 try:
     import torch
@@ -109,15 +85,6 @@ print("CACHE_DIR:", CACHE_DIR.resolve())
 
 
 # %%
-
-
-COMBINED_PARQUET = CACHE_DIR / "combined.parquet"
-if not COMBINED_PARQUET.exists():
-    print("Creating combined parquet for NN...")
-    _run_prepare_data(DATA_DIR, COMBINED_PARQUET)
-    print(f"Saved -> {COMBINED_PARQUET}")
-else:
-    print(f"Combined parquet exists -> {COMBINED_PARQUET}")
 
 
 # %%
@@ -1469,814 +1436,303 @@ else:
 
 
 # %%
-# ==================== NEURAL NETWORK: EXTENDED MODEL + DATASET ====================
+# ==================== EXTRATREES: TRAINING & VALIDATION ====================
+
+ET_PARAMS = {
+    "n_estimators": 200,
+    "max_depth": 16,
+    "min_samples_leaf": 50,
+    "max_features": "sqrt",
+    "n_jobs": -1,
+    "random_state": RANDOM_SEED,
+    "class_weight": "balanced_subsample",
+    "warm_start": False,
+}
+
+if TRAIN_ET:
+    print("=" * 60)
+    print("Training ExtraTrees...")
+    print("=" * 60)
+
+    model_et = ExtraTreesClassifier(**ET_PARAMS)
+    model_et.fit(X_main_tr.values, y_main_tr, sample_weight=w_main_tr)
+
+    pred_et_val = model_et.predict_proba(X_main_val.values)[:, 1]
+    ap_et = average_precision_score(y_main_val, pred_et_val)
+    best_iter_et = ET_PARAMS["n_estimators"]
+
+    joblib.dump(model_et, CACHE_DIR / "et_main.joblib", compress=3)
+    with open(CACHE_DIR / "et_meta.json", "w") as f:
+        json.dump({"n_estimators": best_iter_et, "val_ap": float(ap_et)}, f, indent=2)
+
+    del model_et; gc.collect()
+    print(f"ExtraTrees val PR-AUC: {ap_et:.6f}")
 
-import copy
-import logging
-from typing import Optional
-from dataclasses import asdict
-from tqdm.auto import tqdm
-
-from train_last_n_pooling import (
-    filter_segments_by_target_mask,
-    compute_pos_weight_from_binary,
-    get_branch_cat_cols,
-    get_branch_num_cols,
-    get_active_num_cols,
-    LABEL_HISTORY_NUM_COLS,
-    embedding_dim,
-)
-
-nn_logger = logging.getLogger("meta3b1n.nn")
-nn_logger.setLevel(logging.INFO)
-if not nn_logger.handlers:
-    nn_logger.addHandler(logging.StreamHandler())
-
-
-class TabularAugmentedModel(MultiTaskTwoBranchMultiWindowModel):
-    """Base NN model augmented with boosting tabular features.
-
-    After computing the fused sequence representation, projects tabular features
-    through an MLP and concatenates them before the output heads.
-    """
-
-    def __init__(
-        self,
-        all_cat_cols: List[str],
-        cat_cardinalities_total: Dict[str, int],
-        cat_real_cardinalities: Dict[str, int],
-        model_config: ModelConfig,
-        tabular_dim: int,
-    ):
-        super().__init__(
-            all_cat_cols=all_cat_cols,
-            cat_cardinalities_total=cat_cardinalities_total,
-            cat_real_cardinalities=cat_real_cardinalities,
-            model_config=model_config,
-        )
-
-        # Add LayerNorm to encoder outputs — prevents float16 overflow under AMP
-        self.stable_encoder = nn.Sequential(
-            *list(self.stable_encoder.children()),
-            nn.LayerNorm(model_config.event_dim),
-        )
-        self.telemetry_encoder = nn.Sequential(
-            *list(self.telemetry_encoder.children()),
-            nn.LayerNorm(model_config.event_dim),
-        )
-
-        self.tabular_dim = tabular_dim
-        tabular_proj_dim = model_config.hidden_dim // 2
-
-        self.tabular_proj = nn.Sequential(
-            nn.Linear(tabular_dim, model_config.hidden_dim),
-            nn.GELU(),
-            nn.Dropout(model_config.dropout),
-            nn.Linear(model_config.hidden_dim, tabular_proj_dim),
-            nn.GELU(),
-        )
-
-        original_head_in = (
-            self.stable_head_dim
-            + self.telemetry_head_dim
-            + self.session_head_dim
-            + self.future_stable_head_dim
-            + self.future_telemetry_head_dim
-            + self.label_history_head_dim
-        )
-        new_head_in = original_head_in + tabular_proj_dim
-
-        # Rebuild heads with expanded input dimension
-        self.head_red = nn.Sequential(
-            nn.Linear(new_head_in, model_config.hidden_dim),
-            nn.GELU(),
-            nn.Dropout(model_config.dropout),
-            nn.Linear(model_config.hidden_dim, model_config.hidden_dim // 2),
-            nn.GELU(),
-            nn.Dropout(model_config.dropout),
-            nn.Linear(model_config.hidden_dim // 2, 1),
-        )
-        self.head_suspicious = nn.Sequential(
-            nn.Linear(new_head_in, model_config.hidden_dim),
-            nn.GELU(),
-            nn.Dropout(model_config.dropout),
-            nn.Linear(model_config.hidden_dim, model_config.hidden_dim // 2),
-            nn.GELU(),
-            nn.Dropout(model_config.dropout),
-            nn.Linear(model_config.hidden_dim // 2, 1),
-        )
-        self.head_ry = nn.Sequential(
-            nn.Linear(new_head_in, model_config.hidden_dim),
-            nn.GELU(),
-            nn.Dropout(model_config.dropout),
-            nn.Linear(model_config.hidden_dim, model_config.hidden_dim // 2),
-            nn.GELU(),
-            nn.Dropout(model_config.dropout),
-            nn.Linear(model_config.hidden_dim // 2, 1),
-        )
-
-    def forward(
-        self,
-        cats: torch.Tensor,
-        nums: torch.Tensor,
-        valid_mask: torch.Tensor,
-        session_ids: torch.Tensor,
-        telemetry_hist_available: torch.Tensor,
-        future_visible_mask: torch.Tensor,
-        event_ts_ns: torch.Tensor,
-        tabular_features: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
-        # --- Encode branches (inherited from parent) ---
-        stable_event_emb = self._encode_branch(
-            cats=cats, nums=nums, valid_mask=valid_mask,
-            cat_cols=self.model_config.stable_cat_cols,
-            num_cols=self.model_config.stable_num_cols,
-            encoder=self.stable_encoder,
-        )
-        telemetry_event_emb = self._encode_branch(
-            cats=cats, nums=nums, valid_mask=valid_mask,
-            cat_cols=self.model_config.telemetry_cat_cols,
-            num_cols=self.model_config.telemetry_num_cols,
-            encoder=self.telemetry_encoder,
-        )
-
-        telemetry_history_mask = valid_mask & telemetry_hist_available
-
-        # --- Multi-window pooling ---
-        stable_hist_list = self._pool_multi(
-            stable_event_emb, valid_mask, valid_mask,
-        )
-        telemetry_hist_list = self._pool_multi(
-            telemetry_event_emb, valid_mask, telemetry_history_mask,
-        )
-
-        branch_features: Dict[str, torch.Tensor] = {}
-        branch_features["stable_past"] = torch.cat(
-            self._build_branch_features(stable_event_emb, stable_hist_list, include_current=True),
-            dim=-1,
-        )
-        branch_features["telemetry_past"] = torch.cat(
-            self._build_branch_features(telemetry_event_emb, telemetry_hist_list, include_current=True),
-            dim=-1,
-        )
-
-        if self.model_config.use_session_branch:
-            session_hist_list = self._pool_multi(
-                telemetry_event_emb, valid_mask, valid_mask, session_ids=session_ids,
-            )
-            branch_features["session"] = torch.cat(
-                self._build_branch_features(
-                    telemetry_event_emb, session_hist_list,
-                    include_current=False, branch_weight=self.model_config.session_branch_weight,
-                ),
-                dim=-1,
-            )
-
-        if self.model_config.use_future_branches:
-            stable_future_list = self._pool_multi_future(
-                stable_event_emb, valid_mask, future_visible_mask, event_ts_ns,
-            )
-            branch_features["future_stable"] = torch.cat(
-                self._build_branch_features(
-                    stable_event_emb, stable_future_list,
-                    include_current=False, branch_weight=self.model_config.future_branch_weight,
-                ),
-                dim=-1,
-            )
-            telemetry_future_visible = future_visible_mask & telemetry_hist_available
-            telemetry_future_list = self._pool_multi_future(
-                telemetry_event_emb, valid_mask, telemetry_future_visible, event_ts_ns,
-            )
-            branch_features["future_telemetry"] = torch.cat(
-                self._build_branch_features(
-                    telemetry_event_emb, telemetry_future_list,
-                    include_current=False, branch_weight=self.model_config.future_branch_weight,
-                ),
-                dim=-1,
-            )
-
-        if self.model_config.label_history_num_cols:
-            label_hist_block = self._select_num_block(nums, self.model_config.label_history_num_cols)
-            label_hist_block = label_hist_block * valid_mask.unsqueeze(-1).float()
-            branch_features["label_history"] = label_hist_block
-
-        feats = [branch_features[name] for name in self.active_branch_names]
-        fused = torch.cat(feats, dim=-1)
-        fused = fused * valid_mask.unsqueeze(-1).float()
-
-        # --- Tabular augmentation ---
-        if tabular_features is not None:
-            tab_proj = self.tabular_proj(tabular_features)
-            tab_proj = tab_proj * valid_mask.unsqueeze(-1).float()
-            fused = torch.cat([fused, tab_proj], dim=-1)
-
-        # --- Output heads ---
-        red_logits = self.head_red(fused).squeeze(-1)
-        suspicious_logits = self.head_suspicious(fused).squeeze(-1)
-        ry_logits = self.head_ry(fused).squeeze(-1)
-
-        p_red_main = torch.sigmoid(red_logits)
-        p_suspicious = torch.sigmoid(suspicious_logits)
-        p_red_given_suspicious = torch.sigmoid(ry_logits)
-        p_red_aux = p_suspicious * p_red_given_suspicious
-        final_score = (
-            (1.0 - self.model_config.multitask_inference_blend) * p_red_main
-            + self.model_config.multitask_inference_blend * p_red_aux
-        )
-
-        return {
-            "red_logits": red_logits,
-            "suspicious_logits": suspicious_logits,
-            "ry_logits": ry_logits,
-            "p_red_main": p_red_main,
-            "p_suspicious": p_suspicious,
-            "p_red_given_suspicious": p_red_given_suspicious,
-            "p_red_aux": p_red_aux,
-            "final_score": final_score,
-        }
-
-
-class TabularSequenceSegmentDataset(SequenceSegmentDataset):
-    """SequenceSegmentDataset with sparse tabular feature lookup per event."""
-
-    def __init__(
-        self,
-        store: EncodedSequenceStore,
-        segments: np.ndarray,
-        row_train_mask: np.ndarray,
-        row_pred_mask: np.ndarray,
-        tab_lookup: np.ndarray,    # int32 [n_events], -1 = not present
-        tab_compact: np.ndarray,   # float32 [N_matched, n_features]
-        row_future_visible_mask: Optional[np.ndarray] = None,
-    ):
-        super().__init__(
-            store=store, segments=segments,
-            row_train_mask=row_train_mask, row_pred_mask=row_pred_mask,
-            row_future_visible_mask=row_future_visible_mask,
-        )
-        self.tab_lookup = tab_lookup
-        self.tab_compact = tab_compact
-
-    def __getitem__(self, idx: int) -> dict:
-        result = super().__getitem__(idx)
-        ctx_start, _, _, ctx_end = self.segments[idx]
-        seg_len = ctx_end - ctx_start
-        n_features = self.tab_compact.shape[1]
-        tab_out = np.zeros((seg_len, n_features), dtype=np.float32)
-        indices = self.tab_lookup[ctx_start:ctx_end]  # int32 [seg_len]
-        valid = indices >= 0
-        if valid.any():
-            tab_out[valid] = self.tab_compact[indices[valid]]
-        result["tabular_features"] = tab_out
-        return result
-
-
-def collate_tabular_segments(batch: List[dict]) -> dict:
-    """Collate function that handles tabular features in addition to base fields."""
-    base = collate_segments(batch)
-    batch_size = len(batch)
-    max_len = max(item["tabular_features"].shape[0] for item in batch)
-    n_features = batch[0]["tabular_features"].shape[1]
-    tabular = torch.zeros((batch_size, max_len, n_features), dtype=torch.float32)
-    for i, item in enumerate(batch):
-        L = item["tabular_features"].shape[0]
-        tabular[i, :L] = torch.as_tensor(item["tabular_features"], dtype=torch.float32)
-    base["tabular_features"] = tabular
-    return base
-
-
-def build_tabular_lookup(
-    store: EncodedSequenceStore,
-    train_df: pd.DataFrame,
-    test_df: pd.DataFrame,
-    feature_cols: List[str],
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Sparse tabular lookup — avoids allocating a full [N_events × n_features] matrix.
-
-    Returns:
-        tab_lookup: int32 [n_events] — index into tab_compact, -1 = not present
-        tab_compact: float32 [N_matched, n_features] — features for matched events only
-    """
-    n_events = len(store.event_id)
-    n_features = len(feature_cols)
-
-    # Sort store event_ids once for binary search (temp ~3 GB for 191M rows)
-    store_eid = store.event_id
-    sort_order = np.argsort(store_eid, kind="stable")
-    sorted_eid = store_eid[sort_order]
-
-    tab_lookup = np.full(n_events, -1, dtype=np.int32)
-    compact_parts: List[np.ndarray] = []
-    compact_count = 0
-    filled = 0
-
-    for df in [train_df, test_df]:
-        if "event_id" not in df.columns:
-            continue
-        query_eids = df["event_id"].values
-        feat = df[feature_cols].values.astype(np.float32)
-        np.nan_to_num(feat, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
-
-        pos = np.searchsorted(sorted_eid, query_eids, side="left")
-        clipped = np.minimum(pos, n_events - 1)
-        found = sorted_eid[clipped] == query_eids
-        found &= pos < n_events
-
-        store_pos = sort_order[pos[found]]
-        # Skip events already filled (duplicates across dfs)
-        new_mask = tab_lookup[store_pos] == -1
-        new_store_pos = store_pos[new_mask]
-        new_feat = feat[found][new_mask]
-
-        if len(new_store_pos) > 0:
-            new_idx = np.arange(compact_count, compact_count + len(new_store_pos), dtype=np.int32)
-            tab_lookup[new_store_pos] = new_idx
-            compact_parts.append(new_feat)
-            compact_count += len(new_store_pos)
-            filled += len(new_store_pos)
-
-        del feat, pos, clipped, found, store_pos, new_mask
-        gc.collect()
-
-    del sort_order, sorted_eid
-    gc.collect()
-
-    tab_compact = np.concatenate(compact_parts, axis=0) if compact_parts else np.zeros((0, n_features), dtype=np.float32)
-    print(f"Tabular lookup: {filled}/{n_events} events filled ({100 * filled / max(n_events, 1):.1f}%)")
-    print(f"  tab_lookup: {tab_lookup.nbytes / 1e9:.2f} GB  tab_compact: {tab_compact.nbytes / 1e9:.2f} GB")
-    return tab_lookup, tab_compact
-
-
-def train_one_epoch_tabular(
-    model, loader, optimizer, scaler,
-    pos_weight_red, pos_weight_suspicious, pos_weight_ry,
-    aux_loss_weight_suspicious, aux_loss_weight_red_yellow,
-    grad_clip, device,
-):
-    """One training epoch with AMP and tabular features."""
-    model.train()
-    pw_red_t = torch.tensor(pos_weight_red, dtype=torch.float32, device=device)
-    pw_susp_t = torch.tensor(pos_weight_suspicious, dtype=torch.float32, device=device)
-    pw_ry_t = torch.tensor(pos_weight_ry, dtype=torch.float32, device=device)
-    criterion_red = nn.BCEWithLogitsLoss(reduction="none", pos_weight=pw_red_t)
-    criterion_susp = nn.BCEWithLogitsLoss(reduction="none", pos_weight=pw_susp_t)
-    criterion_ry = nn.BCEWithLogitsLoss(reduction="none", pos_weight=pw_ry_t)
-
-    total_loss_sum, total_count = 0.0, 0
-
-    pbar = tqdm(loader, desc="train", unit="batch", leave=False)
-    for batch in pbar:
-        cats = batch["cats"].to(device, non_blocking=True)
-        nums = batch["nums"].to(device, non_blocking=True)
-        labels_red = batch["labels"].to(device, non_blocking=True)
-        target_raw = batch["target_raw"].to(device, non_blocking=True)
-        session_ids = batch["session_ids"].to(device, non_blocking=True)
-        tel_hist = batch["telemetry_hist_available"].to(device, non_blocking=True)
-        valid_mask = batch["valid_mask"].to(device, non_blocking=True)
-        train_mask = batch["train_mask"].to(device, non_blocking=True)
-        future_vis = batch["future_visible_mask"].to(device, non_blocking=True)
-        event_ts = batch["event_ts_ns"].to(device, non_blocking=True)
-        tab_feat = batch["tabular_features"].to(device, non_blocking=True)
-
-        labeled_mask = train_mask & (target_raw > 0)
-        n_labeled = int(labeled_mask.sum().item())
-        if n_labeled == 0:
-            continue
-
-        optimizer.zero_grad(set_to_none=True)
-        amp_enabled = device.type == "cuda"
-        with torch.amp.autocast("cuda", enabled=amp_enabled):
-            out = model(
-                cats, nums, valid_mask, session_ids,
-                tel_hist, future_vis, event_ts,
-                tabular_features=tab_feat,
-            )
-
-        # Compute loss in float32 outside autocast to avoid float16 overflow
-        logits_red = out["red_logits"].float()
-        logits_susp = out["suspicious_logits"].float()
-        logits_ry = out["ry_logits"].float()
-
-        losses = []
-        loss_r = criterion_red(logits_red, labels_red)
-        loss_r = (loss_r * labeled_mask.float()).sum() / labeled_mask.float().sum().clamp_min(1.0)
-        losses.append(loss_r)
-
-        if aux_loss_weight_suspicious > 0:
-            y_s = ((target_raw == 2) | (target_raw == 3)).float()
-            loss_s = criterion_susp(logits_susp, y_s)
-            loss_s = (loss_s * labeled_mask.float()).sum() / labeled_mask.float().sum().clamp_min(1.0)
-            losses.append(aux_loss_weight_suspicious * loss_s)
-
-        if aux_loss_weight_red_yellow > 0:
-            ry_mask = train_mask & ((target_raw == 2) | (target_raw == 3))
-            n_ry = int(ry_mask.sum().item())
-            if n_ry > 0:
-                y_ry = (target_raw == 3).float()
-                loss_ry = criterion_ry(logits_ry, y_ry)
-                loss_ry = (loss_ry * ry_mask.float()).sum() / ry_mask.float().sum().clamp_min(1.0)
-                losses.append(aux_loss_weight_red_yellow * loss_ry)
-
-        loss = sum(losses)
-
-        if not torch.isfinite(loss):
-            continue  # skip NaN/inf batches
-
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
-
-        total_loss_sum += float(loss.item()) * n_labeled
-        total_count += n_labeled
-        avg = total_loss_sum / total_count if total_count > 0 else float("nan")
-        pbar.set_postfix(loss=f"{avg:.4f}", refresh=False)
-
-    pbar.close()
-    return {"total_loss": (total_loss_sum / total_count) if total_count > 0 else float("nan")}
-
-
-@torch.no_grad()
-def predict_loader_tabular(model, loader, device, use_pred_mask=True):
-    """Predict with tabular-augmented model using AMP."""
-    model.eval()
-    all_idx, all_final, all_target_raw = [], [], []
-
-    for batch in tqdm(loader, desc="predict", unit="batch", leave=False):
-        cats = batch["cats"].to(device, non_blocking=True)
-        nums = batch["nums"].to(device, non_blocking=True)
-        session_ids = batch["session_ids"].to(device, non_blocking=True)
-        tel_hist = batch["telemetry_hist_available"].to(device, non_blocking=True)
-        valid_mask = batch["valid_mask"].to(device, non_blocking=True)
-        future_vis = batch["future_visible_mask"].to(device, non_blocking=True)
-        event_ts = batch["event_ts_ns"].to(device, non_blocking=True)
-        tab_feat = batch["tabular_features"].to(device, non_blocking=True)
-
-        with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-            out = model(
-                cats, nums, valid_mask, session_ids,
-                tel_hist, future_vis, event_ts,
-                tabular_features=tab_feat,
-            )
-
-        final = torch.nan_to_num(out["final_score"], nan=0.0, posinf=1.0, neginf=0.0).cpu()
-        mask = batch["pred_mask"] if use_pred_mask else batch["train_mask"]
-        all_idx.append(batch["row_idx"][mask].numpy())
-        all_final.append(final[mask].numpy())
-        all_target_raw.append(batch["target_raw"][mask].numpy())
-
-    if not all_idx:
-        return {
-            "idx": np.empty(0, np.int64),
-            "final_score": np.empty(0, np.float32),
-            "target_raw": np.empty(0, np.int64),
-        }
-
-    return {
-        "idx": np.concatenate(all_idx).astype(np.int64),
-        "final_score": np.concatenate(all_final).astype(np.float32),
-        "target_raw": np.concatenate(all_target_raw).astype(np.int64),
-    }
-
-
-# %%
-# ==================== NEURAL NETWORK: DATA PREPARATION ====================
-
-print("=" * 60)
-print("Preparing NN data...")
-print("=" * 60)
-
-NN_USE_LABEL_HISTORY = True
-NN_USE_SESSION_BRANCH = False
-NN_USE_FUTURE_BRANCHES = False
-NN_HISTORY_WINDOWS = [3, 10, 30, 100]
-NN_MAX_PRED_SEQ_LEN = 256
-NN_AUX_LOSS_WEIGHT_SUSPICIOUS = 0.5
-NN_AUX_LOSS_WEIGHT_RED_YELLOW = 0.5
-NN_MULTITASK_INFERENCE_BLEND = 0.4
-NN_GRAD_CLIP = 1.0
-NN_WEIGHT_DECAY = 1e-4
-
-nn_active_cat_cols = list(NN_BASE_CAT_COLS)
-nn_active_num_cols = get_active_num_cols(use_label_history=NN_USE_LABEL_HISTORY)
-
-# ---- Free boosting matrices before loading NN store (~20 GB freed) ----
-try: del X_main_tr, X_main_val, X_test
-except NameError: pass
-try: del main_train_df
-except NameError: pass
-gc.collect()
-
-# ---- Build lightweight filtered parquet (datasets 1+3 only: 86M rows vs 191M) ----
-# Drops 90.9M pretrain (dataset 0) + 14.1M pretest (dataset 2) rows.
-# One-time streaming operation; subsequent runs use the cache.
-NN_INPUT_PARQUET = CACHE_DIR / "nn_input_ds1_ds3.parquet"
-if not NN_INPUT_PARQUET.exists():
-    print("Filtering combined parquet to datasets 1+3 (191M → ~86M rows)...")
-    (
-        pl.scan_parquet(str(COMBINED_PARQUET))
-        .filter(pl.col("dataset").is_in([1, 3]))
-        .sink_parquet(str(NN_INPUT_PARQUET))
-    )
-    _n = pl.scan_parquet(str(NN_INPUT_PARQUET)).select(pl.len()).collect().item()
-    print(f"  Saved {NN_INPUT_PARQUET.name}: {_n:,} rows")
 else:
-    print(f"NN parquet cached: {NN_INPUT_PARQUET}")
+    print("Loading ExtraTrees from cache...")
+    with open(CACHE_DIR / "et_meta.json") as f:
+        et_meta = json.load(f)
+    ap_et = et_meta["val_ap"]
+    best_iter_et = et_meta["n_estimators"]
 
-nn_store, _ = load_and_preprocess(
-    input_path=str(NN_INPUT_PARQUET),
-    active_cat_cols=nn_active_cat_cols,
-    use_label_history=NN_USE_LABEL_HISTORY,
-    logger=nn_logger,
-)
-
-# Vocab fit mask: train (dataset 1) before val start (pretrain dropped)
-nn_event_ts = nn_store.event_dttm.astype("datetime64[ns]")
-nn_val_start_np = np.datetime64(VAL_START)
-nn_vocab_mask = (nn_store.dataset_id == 1) & (nn_event_ts < nn_val_start_np)
-
-(
-    nn_encoded_store, nn_cat_card_total, nn_cat_real_card,
-    nn_cat_mode_info, nn_cat_enc_stats, nn_cat_vocab_values,
-) = build_encoded_store(
-    store=nn_store,
-    vocab_fit_mask=nn_vocab_mask,
-    one_hot_max_cardinality=0,
-    logger=nn_logger,
-    tag="meta3b1n",
-)
-del nn_store; gc.collect()
-
-# Downcast cat_matrix int32→int16: all cardinalities fit int16 (max ~65K). Saves 5.7 GB.
-nn_encoded_store.cat_matrix = nn_encoded_store.cat_matrix.astype(np.int16)
-gc.collect()
-
-nn_segments = build_segments(
-    customer_id=nn_encoded_store.customer_id,
-    event_dttm=nn_encoded_store.event_dttm,
-    last_n=NN_LAST_N,
-    max_pred_seq_len=NN_MAX_PRED_SEQ_LEN,
-    use_future_branches=NN_USE_FUTURE_BRANCHES,
-    future_windows=[],
-    future_max_hours=24.0,
-)
-print(f"Total segments: {len(nn_segments):,}")
-
-# Rebuild event timestamps from encoded store for masking
-nn_event_ts = nn_encoded_store.event_dttm.astype("datetime64[ns]")
-
-# Train/val/test masks (boolean arrays over ALL rows in store)
-nn_train_mask = (
-    (nn_encoded_store.dataset_id == 1)
-    & (nn_encoded_store.target_raw > 0)
-    & (nn_event_ts < nn_val_start_np)
-)
-nn_val_mask = (
-    (nn_encoded_store.dataset_id == 1)
-    & (nn_encoded_store.target_raw > 0)
-    & (nn_event_ts >= nn_val_start_np)
-)
-nn_test_mask = (nn_encoded_store.dataset_id == 3)
-nn_future_vis_mask = np.zeros(len(nn_encoded_store.event_id), dtype=bool)
-
-print(f"NN train rows: {nn_train_mask.sum():,}  val rows: {nn_val_mask.sum():,}  test rows: {nn_test_mask.sum():,}")
-
-# Build sparse tabular lookup from boosting features
-nn_tab_lookup, nn_tab_compact = build_tabular_lookup(
-    store=nn_encoded_store,
-    train_df=train_local_df,
-    test_df=test_local_df,
-    feature_cols=FEATURE_COLS,
-)
-# Features captured in tab_compact — free local DFs (~11 GB).
-# train_full_df/test_full_df are rebuilt from train_base_df/test_base_df later.
-try: del train_local_df, test_local_df
-except NameError: pass
-gc.collect()
-
-# Filter segments and create datasets
-nn_train_segments = filter_segments_by_target_mask(nn_segments, nn_train_mask)
-nn_val_segments = filter_segments_by_target_mask(nn_segments, nn_val_mask)
-
-nn_train_dataset = TabularSequenceSegmentDataset(
-    store=nn_encoded_store, segments=nn_train_segments,
-    row_train_mask=nn_train_mask,
-    row_pred_mask=np.zeros_like(nn_train_mask, dtype=bool),
-    tab_lookup=nn_tab_lookup,
-    tab_compact=nn_tab_compact,
-    row_future_visible_mask=nn_future_vis_mask,
-)
-nn_val_dataset = TabularSequenceSegmentDataset(
-    store=nn_encoded_store, segments=nn_val_segments,
-    row_train_mask=np.zeros_like(nn_val_mask, dtype=bool),
-    row_pred_mask=nn_val_mask,
-    tab_lookup=nn_tab_lookup,
-    tab_compact=nn_tab_compact,
-    row_future_visible_mask=nn_future_vis_mask,
-)
-
-nn_device = torch.device("cuda" if torch.cuda.is_available() and USE_GPU else "cpu")
-
-nn_train_loader = DataLoader(
-    nn_train_dataset, batch_size=NN_BATCH_SIZE, shuffle=True,
-    num_workers=0, pin_memory=(nn_device.type == "cuda"),
-    collate_fn=collate_tabular_segments, drop_last=False,
-)
-nn_val_loader = DataLoader(
-    nn_val_dataset, batch_size=NN_BATCH_SIZE, shuffle=False,
-    num_workers=0, pin_memory=(nn_device.type == "cuda"),
-    collate_fn=collate_tabular_segments, drop_last=False,
-)
-
-print(f"NN train segments: {len(nn_train_segments):,}  val segments: {len(nn_val_segments):,}")
-print(f"NN device: {nn_device}")
+    model_et = joblib.load(CACHE_DIR / "et_main.joblib")
+    pred_et_val = model_et.predict_proba(X_main_val.values)[:, 1]
+    del model_et; gc.collect()
+    print(f"ExtraTrees val PR-AUC: {ap_et:.6f} (cached)")
 
 
 # %%
-# ==================== NEURAL NETWORK: TRAIN / VAL ====================
+# ==================== SIMPLE MLP: TRAINING & VALIDATION ====================
 
-if TRAIN_NN:
-    print("=" * 60)
-    print("Training Neural Network with tabular features")
-    print("=" * 60)
+MLP_HIDDEN_DIMS = [256, 128]
+MLP_DROPOUT = 0.2
+MLP_LR = 1e-3
+MLP_WEIGHT_DECAY = 1e-4
+MLP_BATCH_SIZE = 4096
+MLP_MAX_EPOCHS = 20
+MLP_PATIENCE = 5
 
-    set_seed(RANDOM_SEED)
 
-    stable_cat_cols, telemetry_cat_cols = get_branch_cat_cols(nn_encoded_store.active_cat_cols)
-    stable_num_cols, telemetry_num_cols = get_branch_num_cols()
-    label_hist_cols = list(LABEL_HISTORY_NUM_COLS) if NN_USE_LABEL_HISTORY else []
+class SimpleMLP(nn.Module):
+    def __init__(self, input_dim, hidden_dims, dropout=0.2):
+        super().__init__()
+        layers = []
+        prev_dim = input_dim
+        for h_dim in hidden_dims:
+            layers.extend([
+                nn.Linear(prev_dim, h_dim),
+                nn.BatchNorm1d(h_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            ])
+            prev_dim = h_dim
+        layers.append(nn.Linear(prev_dim, 1))
+        self.net = nn.Sequential(*layers)
 
-    nn_model_config = ModelConfig(
-        history_windows=NN_HISTORY_WINDOWS,
-        future_windows=[],
-        all_num_cols=list(nn_encoded_store.active_num_cols),
-        hidden_dim=NN_HIDDEN_DIM,
-        event_dim=NN_EVENT_DIM,
-        dropout=NN_DROPOUT,
-        multitask_inference_blend=NN_MULTITASK_INFERENCE_BLEND,
-        use_session_branch=NN_USE_SESSION_BRANCH,
-        session_branch_weight=0.5,
-        one_hot_max_cardinality=0,
-        stable_cat_cols=stable_cat_cols,
-        telemetry_cat_cols=telemetry_cat_cols,
-        stable_num_cols=stable_num_cols,
-        telemetry_num_cols=telemetry_num_cols,
-        label_history_num_cols=label_hist_cols,
-        use_future_branches=NN_USE_FUTURE_BRANCHES,
-        future_max_hours=24.0,
-        future_branch_weight=0.5,
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
+
+def _train_mlp(
+    X_tr_np, y_tr_np, w_tr_np, X_val_np, y_val_np,
+    hidden_dims, dropout, lr, weight_decay, batch_size, max_epochs, patience, device,
+):
+    """Train a simple MLP with early stopping on val PR-AUC."""
+    # Standardize features
+    scaler = StandardScaler()
+    X_tr_scaled = scaler.fit_transform(X_tr_np).astype(np.float32)
+    X_val_scaled = scaler.transform(X_val_np).astype(np.float32)
+
+    # Replace NaN/Inf after scaling (edge case: constant features)
+    X_tr_scaled = np.nan_to_num(X_tr_scaled, nan=0.0, posinf=0.0, neginf=0.0)
+    X_val_scaled = np.nan_to_num(X_val_scaled, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Tensors
+    t_X_tr = torch.from_numpy(X_tr_scaled)
+    t_y_tr = torch.from_numpy(y_tr_np.astype(np.float32))
+    t_w_tr = torch.from_numpy(w_tr_np.astype(np.float32))
+    t_X_val = torch.from_numpy(X_val_scaled)
+
+    train_ds = TensorDataset(t_X_tr, t_y_tr, t_w_tr)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                              pin_memory=(device.type == "cuda"), drop_last=False)
+
+    # Model
+    model = SimpleMLP(X_tr_scaled.shape[1], hidden_dims, dropout).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=lr, steps_per_epoch=len(train_loader), epochs=max_epochs,
     )
+    grad_scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
-    nn_model = TabularAugmentedModel(
-        all_cat_cols=nn_encoded_store.active_cat_cols,
-        cat_cardinalities_total=nn_cat_card_total,
-        cat_real_cardinalities=nn_cat_real_card,
-        model_config=nn_model_config,
-        tabular_dim=len(FEATURE_COLS),
-    ).to(nn_device)
+    # Pos weight for class imbalance
+    n_pos = float(y_tr_np.sum())
+    n_neg = float(len(y_tr_np) - n_pos)
+    pos_weight = torch.tensor([min(n_neg / max(n_pos, 1.0), 500.0)], device=device)
 
-    print(f"NN model params: {sum(p.numel() for p in nn_model.parameters()):,}")
-
-    # Pos weights from training labels
-    nn_train_target_raw = nn_encoded_store.target_raw[nn_train_mask]
-    pw_red = compute_pos_weight_from_binary((nn_train_target_raw == 3).astype(np.int64))
-    pw_suspicious = compute_pos_weight_from_binary(np.isin(nn_train_target_raw, [2, 3]).astype(np.int64))
-    ry_subset = nn_train_target_raw[np.isin(nn_train_target_raw, [2, 3])]
-    pw_ry = compute_pos_weight_from_binary((ry_subset == 3).astype(np.int64)) if len(ry_subset) > 0 else 1.0
-
-    nn_optimizer = torch.optim.AdamW(nn_model.parameters(), lr=NN_LR, weight_decay=NN_WEIGHT_DECAY)
-    nn_scaler = torch.amp.GradScaler("cuda", enabled=(nn_device.type == "cuda"))
-
+    best_ap = -1.0
+    best_epoch = 0
     best_state = None
-    best_ap_nn = -1.0
-    best_epoch_nn = 0
-    epochs_no_improve = 0
+    wait = 0
 
-    for epoch in range(1, NN_MAX_EPOCHS + 1):
-        train_stats = train_one_epoch_tabular(
-            model=nn_model, loader=nn_train_loader, optimizer=nn_optimizer, scaler=nn_scaler,
-            pos_weight_red=pw_red, pos_weight_suspicious=pw_suspicious, pos_weight_ry=pw_ry,
-            aux_loss_weight_suspicious=NN_AUX_LOSS_WEIGHT_SUSPICIOUS,
-            aux_loss_weight_red_yellow=NN_AUX_LOSS_WEIGHT_RED_YELLOW,
-            grad_clip=NN_GRAD_CLIP, device=nn_device,
-        )
+    for epoch in range(1, max_epochs + 1):
+        model.train()
+        epoch_loss = 0.0
+        n_batches = 0
 
-        val_pred = predict_loader_tabular(nn_model, nn_val_loader, nn_device, use_pred_mask=True)
+        for batch_X, batch_y, batch_w in train_loader:
+            batch_X = batch_X.to(device, non_blocking=True)
+            batch_y = batch_y.to(device, non_blocking=True)
+            batch_w = batch_w.to(device, non_blocking=True)
 
-        val_labeled = val_pred["target_raw"] > 0
-        if val_labeled.sum() > 0:
-            y_val_nn = (val_pred["target_raw"][val_labeled] == 3).astype(np.float32)
-            scores_val = np.nan_to_num(val_pred["final_score"][val_labeled], nan=0.0, posinf=1.0, neginf=0.0)
-            val_ap_epoch = average_precision_score(y_val_nn, scores_val)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
+                logits = model(batch_X)
+                loss_per_sample = F.binary_cross_entropy_with_logits(
+                    logits, batch_y, pos_weight=pos_weight, reduction="none",
+                )
+                loss = (loss_per_sample * batch_w).mean()
+
+            grad_scaler.scale(loss).backward()
+            grad_scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            grad_scaler.step(optimizer)
+            grad_scaler.update()
+            scheduler.step()
+
+            epoch_loss += loss.item()
+            n_batches += 1
+
+        # Validation
+        model.eval()
+        with torch.no_grad(), torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
+            val_logits = model(t_X_val.to(device))
+            val_probs = torch.sigmoid(val_logits).cpu().numpy()
+
+        val_ap = average_precision_score(y_val_np, val_probs)
+        avg_loss = epoch_loss / max(n_batches, 1)
+        print(f"  Epoch {epoch}/{max_epochs} | loss={avg_loss:.4f} | val PR-AUC={val_ap:.6f}")
+
+        if val_ap > best_ap:
+            best_ap = val_ap
+            best_epoch = epoch
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            wait = 0
         else:
-            val_ap_epoch = float("nan")
-
-        print(f"  Epoch {epoch}/{NN_MAX_EPOCHS} | loss={train_stats['total_loss']:.4f} | val_AP={val_ap_epoch:.6f}")
-
-        if val_ap_epoch > best_ap_nn:
-            best_ap_nn = val_ap_epoch
-            best_epoch_nn = epoch
-            best_state = copy.deepcopy(nn_model.state_dict())
-            epochs_no_improve = 0
-        else:
-            epochs_no_improve += 1
-
-        if epochs_no_improve >= NN_PATIENCE:
-            print(f"  Early stopping at epoch {epoch}")
-            break
+            wait += 1
+            if wait >= patience:
+                print(f"  Early stopping at epoch {epoch} (patience={patience})")
+                break
 
         gc.collect()
-        if nn_device.type == "cuda":
+        if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    if best_state is not None:
-        nn_model.load_state_dict(best_state)
+    # Load best state and get final predictions
+    model.load_state_dict(best_state)
+    model.eval()
+    with torch.no_grad(), torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
+        val_logits = model(t_X_val.to(device))
+        val_preds = torch.sigmoid(val_logits).cpu().numpy()
 
-    # Final val predictions with best model
-    val_pred_best = predict_loader_tabular(nn_model, nn_val_loader, nn_device, use_pred_mask=True)
-
-    # Save model checkpoint and predictions
-    torch.save({
-        "state_dict": nn_model.state_dict(),
-        "model_config": asdict(nn_model_config),
-        "cat_cardinalities_total": nn_cat_card_total,
-        "cat_real_cardinalities": nn_cat_real_card,
-        "tabular_dim": len(FEATURE_COLS),
-        "best_epoch": best_epoch_nn,
-        "best_ap": best_ap_nn,
-    }, CACHE_DIR / "nn_val.pt")
-
-    np.savez_compressed(
-        CACHE_DIR / "nn_val_preds.npz",
-        idx=val_pred_best["idx"],
-        final_score=val_pred_best["final_score"],
-        target_raw=val_pred_best["target_raw"],
-    )
-
-    nn_meta = {"best_epoch": best_epoch_nn, "val_ap": best_ap_nn}
-    with open(CACHE_DIR / "nn_meta.json", "w") as f:
-        json.dump(nn_meta, f, indent=2)
-
-    ap_nn = best_ap_nn
-    print(f"NN best epoch: {best_epoch_nn}, val PR-AUC: {ap_nn:.6f}")
-
-    del nn_model, nn_optimizer, nn_scaler; gc.collect()
-    if nn_device.type == "cuda":
+    del model, optimizer, grad_scaler, scheduler
+    gc.collect()
+    if device.type == "cuda":
         torch.cuda.empty_cache()
 
+    return val_preds, best_ap, best_epoch, best_state, scaler
+
+
+if TRAIN_MLP:
+    print("=" * 60)
+    print("Training Simple MLP...")
+    print("=" * 60)
+
+    mlp_device = torch.device("cuda" if torch.cuda.is_available() and USE_GPU else "cpu")
+    print(f"MLP device: {mlp_device}")
+
+    pred_mlp_val, ap_mlp, best_epoch_mlp, mlp_best_state, mlp_scaler = _train_mlp(
+        X_main_tr.values, y_main_tr, w_main_tr,
+        X_main_val.values, y_main_val,
+        MLP_HIDDEN_DIMS, MLP_DROPOUT, MLP_LR, MLP_WEIGHT_DECAY,
+        MLP_BATCH_SIZE, MLP_MAX_EPOCHS, MLP_PATIENCE, mlp_device,
+    )
+
+    # Save checkpoint
+    torch.save({
+        "state_dict": mlp_best_state,
+        "input_dim": X_main_tr.shape[1],
+        "hidden_dims": MLP_HIDDEN_DIMS,
+        "dropout": MLP_DROPOUT,
+        "best_epoch": best_epoch_mlp,
+        "best_ap": ap_mlp,
+    }, CACHE_DIR / "mlp_val.pt")
+    joblib.dump(mlp_scaler, CACHE_DIR / "mlp_scaler.joblib")
+
+    with open(CACHE_DIR / "mlp_meta.json", "w") as f:
+        json.dump({"best_epoch": best_epoch_mlp, "val_ap": float(ap_mlp)}, f, indent=2)
+
+    del mlp_best_state; gc.collect()
+    print(f"MLP best epoch: {best_epoch_mlp}, val PR-AUC: {ap_mlp:.6f}")
+
 else:
-    print("Loading NN from cache...")
-    with open(CACHE_DIR / "nn_meta.json") as f:
-        nn_meta = json.load(f)
-    best_epoch_nn = nn_meta["best_epoch"]
-    ap_nn = nn_meta["val_ap"]
+    print("Loading MLP from cache...")
+    with open(CACHE_DIR / "mlp_meta.json") as f:
+        mlp_meta = json.load(f)
+    best_epoch_mlp = mlp_meta["best_epoch"]
+    ap_mlp = mlp_meta["val_ap"]
 
-    nn_val_preds_data = np.load(CACHE_DIR / "nn_val_preds.npz")
-    val_pred_best = {
-        "idx": nn_val_preds_data["idx"],
-        "final_score": nn_val_preds_data["final_score"],
-        "target_raw": nn_val_preds_data["target_raw"],
-    }
-    print(f"NN val PR-AUC: {ap_nn:.6f} (cached)")
+    mlp_device = torch.device("cuda" if torch.cuda.is_available() and USE_GPU else "cpu")
+    mlp_scaler = joblib.load(CACHE_DIR / "mlp_scaler.joblib")
+    ckpt = torch.load(CACHE_DIR / "mlp_val.pt", map_location=mlp_device, weights_only=True)
+    mlp_model_cached = SimpleMLP(ckpt["input_dim"], ckpt["hidden_dims"], ckpt["dropout"]).to(mlp_device)
+    mlp_model_cached.load_state_dict(ckpt["state_dict"])
+    mlp_model_cached.eval()
 
-# Align NN val predictions with boosting val order (by event_id)
-nn_val_event_ids = nn_encoded_store.event_id[val_pred_best["idx"]]
-nn_val_scores_df = pd.DataFrame({"event_id": nn_val_event_ids, "nn_score": val_pred_best["final_score"]})
-pred_nn_val_aligned = main_val_df[["event_id"]].merge(nn_val_scores_df, on="event_id", how="left")
-pred_nn_val = pred_nn_val_aligned["nn_score"].fillna(0.0).values.astype(np.float32)
-nn_val_coverage = pred_nn_val_aligned["nn_score"].notna().sum()
-print(f"NN val predictions aligned: {nn_val_coverage}/{len(main_val_df)} events matched")
+    X_val_scaled = mlp_scaler.transform(X_main_val.values).astype(np.float32)
+    X_val_scaled = np.nan_to_num(X_val_scaled, nan=0.0, posinf=0.0, neginf=0.0)
+    with torch.no_grad(), torch.amp.autocast("cuda", enabled=(mlp_device.type == "cuda")):
+        pred_mlp_val = torch.sigmoid(
+            mlp_model_cached(torch.from_numpy(X_val_scaled).to(mlp_device))
+        ).cpu().numpy()
+
+    del mlp_model_cached, ckpt; gc.collect()
+    print(f"MLP val PR-AUC: {ap_mlp:.6f} (cached)")
 
 
 # %%
-# ==================== 4-MODEL META-BLEND ====================
+# ==================== BLEND COMBINATIONS ====================
 
-heads_meta = {
+# -- All val predictions in rank-normalized space --
+all_val_heads = {
     "catboost": rank_norm(pred_cb_val),
     "lightgbm": rank_norm(pred_lgb_val),
     "xgboost": rank_norm(pred_xgb_val),
-    "nn": rank_norm(pred_nn_val),
+    "extratrees": rank_norm(pred_et_val),
+    "mlp": rank_norm(pred_mlp_val),
 }
 
-blend_keys, best_meta_w, best_meta_ap = optimize_blend_weights(
-    heads_meta, y_main_val, method=BLEND_METHOD,
-)
+# -- Define key blend combinations --
+BLEND_COMBOS = [
+    ("cb_lgb", ["catboost", "lightgbm"]),
+    ("cb_xgb", ["catboost", "xgboost"]),
+    ("lgb_xgb", ["lightgbm", "xgboost"]),
+    ("3boost", ["catboost", "lightgbm", "xgboost"]),
+    ("3boost_et", ["catboost", "lightgbm", "xgboost", "extratrees"]),
+    ("3boost_mlp", ["catboost", "lightgbm", "xgboost", "mlp"]),
+    ("all5", ["catboost", "lightgbm", "xgboost", "extratrees", "mlp"]),
+    ("et_mlp", ["extratrees", "mlp"]),
+]
 
-meta_blend_val = sum(best_meta_w[i] * heads_meta[blend_keys[i]] for i in range(len(blend_keys)))
+blend_results = {}
+for combo_name, combo_keys in BLEND_COMBOS:
+    heads_sub = {k: all_val_heads[k] for k in combo_keys}
+    b_keys, b_w, b_ap = optimize_blend_weights(heads_sub, y_main_val, method=BLEND_METHOD)
+    blend_results[combo_name] = {"keys": b_keys, "weights": b_w, "val_ap": b_ap}
+    w_str = ", ".join(f"{b_keys[i]}={b_w[i]:.4f}" for i in range(len(b_keys)))
+    print(f"  {combo_name:15s}  PR-AUC={b_ap:.6f}  [{w_str}]")
 
-blend_result = {
-    "method": BLEND_METHOD,
-    "keys": blend_keys,
-    "weights": [float(w) for w in best_meta_w],
-    "val_ap": float(best_meta_ap),
-}
-with open(CACHE_DIR / "meta_blend.json", "w") as f:
-    json.dump(blend_result, f, indent=2)
+# Find best blend
+best_combo_name = max(blend_results, key=lambda k: blend_results[k]["val_ap"])
+best_blend = blend_results[best_combo_name]
+blend_keys = best_blend["keys"]
+best_meta_w = best_blend["weights"]
+best_meta_ap = best_blend["val_ap"]
 
-print(f"\nMeta-blend ({BLEND_METHOD}): PR-AUC = {best_meta_ap:.6f}")
-for i, k in enumerate(blend_keys):
-    print(f"  {k}: {best_meta_w[i]:.4f}")
+# Save all blend configs
+all_blend_config = {}
+for combo_name, res in blend_results.items():
+    all_blend_config[combo_name] = {
+        "method": BLEND_METHOD,
+        "keys": res["keys"],
+        "weights": [float(w) for w in res["weights"]],
+        "val_ap": float(res["val_ap"]),
+    }
+with open(CACHE_DIR / "blend_results.json", "w") as f:
+    json.dump(all_blend_config, f, indent=2)
+
+print(f"\nBest blend: {best_combo_name} -> PR-AUC = {best_meta_ap:.6f}")
+print(f"Blend results saved to {CACHE_DIR / 'blend_results.json'}")
 
 
 # %%
@@ -2373,148 +1829,111 @@ print("Booster test predictions ready.")
 
 
 # %%
-# ==================== REFIT & TEST PREDICTIONS: NN ====================
+# ==================== REFIT & TEST PREDICTIONS: EXTRATREES + MLP ====================
 
-# NN tabular columns must match val model's tabular_dim
-NN_TABULAR_COLS = list(FEATURE_COLS)
-assert all(c in train_full_df.columns for c in NN_TABULAR_COLS), "Missing NN tabular cols in train_full_df"
-assert all(c in test_full_df.columns for c in NN_TABULAR_COLS), "Missing NN tabular cols in test_full_df"
+# --- ExtraTrees ---
+if RETRAIN_ON_FULL_ET:
+    print("Refit ExtraTrees on full train...")
+    model_et_full = ExtraTreesClassifier(**ET_PARAMS)
+    model_et_full.fit(X_main_full.values, y_main_full, sample_weight=w_main_full)
+    joblib.dump(model_et_full, CACHE_DIR / "et_main_full.joblib", compress=3)
+else:
+    print("Loading ExtraTrees (val model) for test prediction...")
+    model_et_full = joblib.load(CACHE_DIR / "et_main.joblib")
 
-nn_tab_lookup_full, nn_tab_compact_full = build_tabular_lookup(
-    store=nn_encoded_store,
-    train_df=train_full_df,
-    test_df=test_full_df,
-    feature_cols=NN_TABULAR_COLS,
-)
+pred_et_test = model_et_full.predict_proba(X_test_full.values)[:, 1]
+del model_et_full; gc.collect()
 
-nn_test_segments = filter_segments_by_target_mask(nn_segments, nn_test_mask)
+# --- MLP ---
+if RETRAIN_ON_FULL_MLP:
+    print("Refit MLP on full train...")
+    mlp_device = torch.device("cuda" if torch.cuda.is_available() and USE_GPU else "cpu")
 
-nn_test_dataset_full = TabularSequenceSegmentDataset(
-    store=nn_encoded_store, segments=nn_test_segments,
-    row_train_mask=np.zeros_like(nn_test_mask, dtype=bool),
-    row_pred_mask=nn_test_mask,
-    tab_lookup=nn_tab_lookup_full,
-    tab_compact=nn_tab_compact_full,
-    row_future_visible_mask=nn_future_vis_mask,
-)
-nn_test_loader = DataLoader(
-    nn_test_dataset_full, batch_size=NN_BATCH_SIZE, shuffle=False,
-    num_workers=0, pin_memory=(nn_device.type == "cuda"),
-    collate_fn=collate_tabular_segments, drop_last=False,
-)
+    # Refit scaler on full data
+    mlp_scaler_full = StandardScaler()
+    X_full_scaled = mlp_scaler_full.fit_transform(X_main_full.values).astype(np.float32)
+    X_full_scaled = np.nan_to_num(X_full_scaled, nan=0.0, posinf=0.0, neginf=0.0)
+    X_test_scaled = mlp_scaler_full.transform(X_test_full.values).astype(np.float32)
+    X_test_scaled = np.nan_to_num(X_test_scaled, nan=0.0, posinf=0.0, neginf=0.0)
 
-if RETRAIN_ON_FULL_NN:
-    print("=" * 60)
-    print("Refit NN on full train data")
-    print("=" * 60)
-    set_seed(RANDOM_SEED)
+    t_X_full = torch.from_numpy(X_full_scaled)
+    t_y_full = torch.from_numpy(y_main_full.astype(np.float32))
+    t_w_full = torch.from_numpy(w_main_full.astype(np.float32))
 
-    # Full train mask: all labeled events (train + val)
-    nn_full_train_mask = (
-        (nn_encoded_store.dataset_id == 1)
-        & (nn_encoded_store.target_raw > 0)
+    full_ds = TensorDataset(t_X_full, t_y_full, t_w_full)
+    full_loader = DataLoader(full_ds, batch_size=MLP_BATCH_SIZE, shuffle=True,
+                             pin_memory=(mlp_device.type == "cuda"), drop_last=False)
+
+    mlp_model_full = SimpleMLP(X_full_scaled.shape[1], MLP_HIDDEN_DIMS, MLP_DROPOUT).to(mlp_device)
+    mlp_opt_full = torch.optim.AdamW(mlp_model_full.parameters(), lr=MLP_LR, weight_decay=MLP_WEIGHT_DECAY)
+    mlp_sched_full = torch.optim.lr_scheduler.OneCycleLR(
+        mlp_opt_full, max_lr=MLP_LR, steps_per_epoch=len(full_loader), epochs=max(1, best_epoch_mlp),
     )
-    nn_full_train_segments = filter_segments_by_target_mask(nn_segments, nn_full_train_mask)
+    mlp_gs_full = torch.amp.GradScaler("cuda", enabled=(mlp_device.type == "cuda"))
 
-    nn_full_train_dataset = TabularSequenceSegmentDataset(
-        store=nn_encoded_store, segments=nn_full_train_segments,
-        row_train_mask=nn_full_train_mask,
-        row_pred_mask=np.zeros_like(nn_full_train_mask, dtype=bool),
-        tab_lookup=nn_tab_lookup_full,
-        tab_compact=nn_tab_compact_full,
-        row_future_visible_mask=nn_future_vis_mask,
-    )
-    nn_full_train_loader = DataLoader(
-        nn_full_train_dataset, batch_size=NN_BATCH_SIZE, shuffle=True,
-        num_workers=0, pin_memory=(nn_device.type == "cuda"),
-        collate_fn=collate_tabular_segments, drop_last=False,
-    )
+    n_pos = float(y_main_full.sum())
+    n_neg = float(len(y_main_full) - n_pos)
+    pw_mlp = torch.tensor([min(n_neg / max(n_pos, 1.0), 500.0)], device=mlp_device)
 
-    # Reuse model config from val phase
-    stable_cat_cols_r, telemetry_cat_cols_r = get_branch_cat_cols(nn_encoded_store.active_cat_cols)
-    stable_num_cols_r, telemetry_num_cols_r = get_branch_num_cols()
-    label_hist_cols_r = list(LABEL_HISTORY_NUM_COLS) if NN_USE_LABEL_HISTORY else []
-
-    nn_model_config_full = ModelConfig(
-        history_windows=NN_HISTORY_WINDOWS, future_windows=[],
-        all_num_cols=list(nn_encoded_store.active_num_cols),
-        hidden_dim=NN_HIDDEN_DIM, event_dim=NN_EVENT_DIM, dropout=NN_DROPOUT,
-        multitask_inference_blend=NN_MULTITASK_INFERENCE_BLEND,
-        use_session_branch=NN_USE_SESSION_BRANCH, session_branch_weight=0.5,
-        one_hot_max_cardinality=0,
-        stable_cat_cols=stable_cat_cols_r, telemetry_cat_cols=telemetry_cat_cols_r,
-        stable_num_cols=stable_num_cols_r, telemetry_num_cols=telemetry_num_cols_r,
-        label_history_num_cols=label_hist_cols_r,
-        use_future_branches=NN_USE_FUTURE_BRANCHES,
-        future_max_hours=24.0, future_branch_weight=0.5,
-    )
-
-    nn_model_full = TabularAugmentedModel(
-        all_cat_cols=nn_encoded_store.active_cat_cols,
-        cat_cardinalities_total=nn_cat_card_total,
-        cat_real_cardinalities=nn_cat_real_card,
-        model_config=nn_model_config_full,
-        tabular_dim=len(NN_TABULAR_COLS),
-    ).to(nn_device)
-
-    # Pos weights from full train
-    nn_full_target = nn_encoded_store.target_raw[nn_full_train_mask]
-    pw_red_f = compute_pos_weight_from_binary((nn_full_target == 3).astype(np.int64))
-    pw_susp_f = compute_pos_weight_from_binary(np.isin(nn_full_target, [2, 3]).astype(np.int64))
-    ry_sub_f = nn_full_target[np.isin(nn_full_target, [2, 3])]
-    pw_ry_f = compute_pos_weight_from_binary((ry_sub_f == 3).astype(np.int64)) if len(ry_sub_f) > 0 else 1.0
-
-    nn_opt_full = torch.optim.AdamW(nn_model_full.parameters(), lr=NN_LR, weight_decay=NN_WEIGHT_DECAY)
-    nn_scaler_full = torch.amp.GradScaler("cuda", enabled=(nn_device.type == "cuda"))
-
-    n_refit_epochs = max(1, best_epoch_nn)
+    n_refit_epochs = max(1, best_epoch_mlp)
     for epoch in range(1, n_refit_epochs + 1):
-        stats = train_one_epoch_tabular(
-            nn_model_full, nn_full_train_loader, nn_opt_full, nn_scaler_full,
-            pw_red_f, pw_susp_f, pw_ry_f,
-            NN_AUX_LOSS_WEIGHT_SUSPICIOUS, NN_AUX_LOSS_WEIGHT_RED_YELLOW,
-            NN_GRAD_CLIP, nn_device,
-        )
-        print(f"  Refit epoch {epoch}/{n_refit_epochs} | loss={stats['total_loss']:.4f}")
+        mlp_model_full.train()
+        epoch_loss = 0.0
+        n_b = 0
+        for bX, by, bw in full_loader:
+            bX = bX.to(mlp_device, non_blocking=True)
+            by = by.to(mlp_device, non_blocking=True)
+            bw = bw.to(mlp_device, non_blocking=True)
+            mlp_opt_full.zero_grad(set_to_none=True)
+            with torch.amp.autocast("cuda", enabled=(mlp_device.type == "cuda")):
+                logits = mlp_model_full(bX)
+                loss = (F.binary_cross_entropy_with_logits(
+                    logits, by, pos_weight=pw_mlp, reduction="none") * bw).mean()
+            mlp_gs_full.scale(loss).backward()
+            mlp_gs_full.unscale_(mlp_opt_full)
+            torch.nn.utils.clip_grad_norm_(mlp_model_full.parameters(), 1.0)
+            mlp_gs_full.step(mlp_opt_full)
+            mlp_gs_full.update()
+            mlp_sched_full.step()
+            epoch_loss += loss.item()
+            n_b += 1
+        print(f"  MLP refit epoch {epoch}/{n_refit_epochs} | loss={epoch_loss / max(n_b, 1):.4f}")
         gc.collect()
-        if nn_device.type == "cuda":
+        if mlp_device.type == "cuda":
             torch.cuda.empty_cache()
 
-    test_pred_nn = predict_loader_tabular(nn_model_full, nn_test_loader, nn_device, use_pred_mask=True)
+    # Predict on test
+    mlp_model_full.eval()
+    with torch.no_grad(), torch.amp.autocast("cuda", enabled=(mlp_device.type == "cuda")):
+        pred_mlp_test = torch.sigmoid(
+            mlp_model_full(torch.from_numpy(X_test_scaled).to(mlp_device))
+        ).cpu().numpy()
 
-    torch.save({"state_dict": nn_model_full.state_dict()}, CACHE_DIR / "nn_full.pt")
-    del nn_model_full, nn_opt_full, nn_scaler_full; gc.collect()
-    if nn_device.type == "cuda":
+    torch.save({"state_dict": mlp_model_full.state_dict()}, CACHE_DIR / "mlp_full.pt")
+    joblib.dump(mlp_scaler_full, CACHE_DIR / "mlp_scaler_full.joblib")
+    del mlp_model_full, mlp_opt_full, mlp_gs_full, mlp_sched_full; gc.collect()
+    if mlp_device.type == "cuda":
         torch.cuda.empty_cache()
 
 else:
-    print("Loading NN (val model) for test prediction...")
-    ckpt = torch.load(CACHE_DIR / "nn_val.pt", map_location=nn_device, weights_only=False)
+    print("Loading MLP (val model) for test prediction...")
+    mlp_device = torch.device("cuda" if torch.cuda.is_available() and USE_GPU else "cpu")
+    mlp_scaler_test = joblib.load(CACHE_DIR / "mlp_scaler.joblib")
+    ckpt = torch.load(CACHE_DIR / "mlp_val.pt", map_location=mlp_device, weights_only=True)
+    mlp_model_test = SimpleMLP(ckpt["input_dim"], ckpt["hidden_dims"], ckpt["dropout"]).to(mlp_device)
+    mlp_model_test.load_state_dict(ckpt["state_dict"])
+    mlp_model_test.eval()
 
-    mc_dict = ckpt["model_config"]
-    nn_model_config_test = ModelConfig(**mc_dict)
+    X_test_scaled = mlp_scaler_test.transform(X_test_full.values).astype(np.float32)
+    X_test_scaled = np.nan_to_num(X_test_scaled, nan=0.0, posinf=0.0, neginf=0.0)
+    with torch.no_grad(), torch.amp.autocast("cuda", enabled=(mlp_device.type == "cuda")):
+        pred_mlp_test = torch.sigmoid(
+            mlp_model_test(torch.from_numpy(X_test_scaled).to(mlp_device))
+        ).cpu().numpy()
 
-    nn_model_test = TabularAugmentedModel(
-        all_cat_cols=nn_encoded_store.active_cat_cols,
-        cat_cardinalities_total=nn_cat_card_total,
-        cat_real_cardinalities=nn_cat_real_card,
-        model_config=nn_model_config_test,
-        tabular_dim=ckpt["tabular_dim"],
-    ).to(nn_device)
-    nn_model_test.load_state_dict(ckpt["state_dict"])
+    del mlp_model_test, ckpt; gc.collect()
 
-    test_pred_nn = predict_loader_tabular(nn_model_test, nn_test_loader, nn_device, use_pred_mask=True)
-    del nn_model_test; gc.collect()
-    if nn_device.type == "cuda":
-        torch.cuda.empty_cache()
-
-# Align NN test predictions with test_full_df order
-nn_test_event_ids = nn_encoded_store.event_id[test_pred_nn["idx"]]
-nn_test_scores_df = pd.DataFrame({"event_id": nn_test_event_ids, "nn_score": test_pred_nn["final_score"]})
-pred_nn_test_aligned = test_full_df[["event_id"]].merge(nn_test_scores_df, on="event_id", how="left")
-pred_nn_test = pred_nn_test_aligned["nn_score"].fillna(0.0).values.astype(np.float32)
-nn_test_coverage = pred_nn_test_aligned["nn_score"].notna().sum()
-print(f"NN test predictions aligned: {nn_test_coverage}/{len(test_full_df)} events")
+print("ET + MLP test predictions ready.")
 
 
 # %%
@@ -2538,22 +1957,27 @@ def make_submission(pred, name, event_ids=test_event_ids):
     return sub
 
 
+# -- Individual model submissions --
 make_submission(pred_cb_test, "cb")
 make_submission(pred_lgb_test, "lgb")
 make_submission(pred_xgb_test, "xgb")
-make_submission(pred_nn_test, "nn")
+make_submission(pred_et_test, "et")
+make_submission(pred_mlp_test, "mlp")
 
-# Meta-blend in rank space
-test_heads_final = {
+# -- All test predictions in rank-normalized space --
+all_test_heads = {
     "catboost": rank_norm(pred_cb_test),
     "lightgbm": rank_norm(pred_lgb_test),
     "xgboost": rank_norm(pred_xgb_test),
-    "nn": rank_norm(pred_nn_test),
+    "extratrees": rank_norm(pred_et_test),
+    "mlp": rank_norm(pred_mlp_test),
 }
-meta_blend_test = sum(
-    best_meta_w[i] * test_heads_final[blend_keys[i]] for i in range(len(blend_keys))
-)
-make_submission(meta_blend_test, "meta3b1n")
+
+# -- Generate submission for each blend combination --
+for combo_name, res in blend_results.items():
+    bk, bw = res["keys"], res["weights"]
+    blend_pred = sum(bw[i] * all_test_heads[bk[i]] for i in range(len(bk)))
+    make_submission(blend_pred, f"blend_{combo_name}")
 
 print("\nAll submissions generated!")
 
@@ -2605,14 +2029,171 @@ plt.show()
 # %%
 # ==================== RESULTS TABLE ====================
 
-results = pd.DataFrame({
-    "Model": ["CatBoost", "LightGBM", "XGBoost", "Neural Network", f"Meta-Blend ({BLEND_METHOD})"],
-    "Val PR-AUC": [ap_cb, ap_lgb, ap_xgb, ap_nn, best_meta_ap],
-    "Best Iter/Epoch": [best_iter_cb, best_iter_lgb, best_iter_xgb, best_epoch_nn, "-"],
-})
+results_rows = [
+    ("CatBoost", ap_cb, str(best_iter_cb)),
+    ("LightGBM", ap_lgb, str(best_iter_lgb)),
+    ("XGBoost", ap_xgb, str(best_iter_xgb)),
+    ("ExtraTrees", ap_et, str(ET_PARAMS["n_estimators"])),
+    ("Simple MLP", ap_mlp, str(best_epoch_mlp)),
+]
+for combo_name, res in blend_results.items():
+    results_rows.append((f"Blend: {combo_name}", res["val_ap"], "-"))
+
+results = pd.DataFrame(results_rows, columns=["Model", "Val PR-AUC", "Best Iter/Epoch"])
+results = results.sort_values("Val PR-AUC", ascending=False)
 results["Val PR-AUC"] = results["Val PR-AUC"].apply(lambda x: f"{x:.6f}" if isinstance(x, float) else x)
 print("\n" + results.to_string(index=False))
 
-print(f"\nBlend method: {BLEND_METHOD}")
+print(f"\nBest blend: {best_combo_name} (PR-AUC = {best_meta_ap:.6f})")
 print(f"Blend weights: { {blend_keys[i]: round(float(best_meta_w[i]), 4) for i in range(len(blend_keys))} }")
 print(f"\nSubmission files saved to: {SUBMISSION_DIR.resolve()}")
+
+
+# %%
+# ==================== MEGA-ENSEMBLE: meta3b1n + sol_154 ====================
+# Logit z-score blending (метод из sol_154/AGI/blend_submissions.py)
+# Работаем через CSV-файлы, merge по event_id — надёжно и без проблем с разным набором строк
+
+SOL154_BLEND_PATH = Path("sol_154/AGI/sub_totalblend.csv")
+
+
+def _logit(p: np.ndarray, eps: float = 1e-7) -> np.ndarray:
+    p = np.clip(p, eps, 1.0 - eps)
+    return np.log(p / (1.0 - p))
+
+
+def _zscore(x: np.ndarray) -> np.ndarray:
+    return (x - x.mean()) / (x.std() + 1e-12)
+
+
+def _sigmoid(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def mega_logit_zscore_blend(
+    preds: Dict[str, np.ndarray],
+    weights: Dict[str, float],
+    eps: float = 1e-7,
+) -> np.ndarray:
+    """Multi-way logit z-score blend: logit -> zscore -> weighted avg -> sigmoid."""
+    total_w = sum(weights[k] for k in preds)
+    z_blend = np.zeros(len(next(iter(preds.values()))), dtype=np.float64)
+    for name, pred in preds.items():
+        w = weights[name] / total_w
+        z_i = _zscore(_logit(pred, eps))
+        nan_cnt = int(np.isnan(z_i).sum())
+        if nan_cnt > 0:
+            print(f"  WARNING: {name} has {nan_cnt} NaN after logit+zscore, filling with 0")
+            z_i = np.nan_to_num(z_i, nan=0.0)
+        z_blend += w * z_i
+    return _sigmoid(z_blend)
+
+
+# -- Загружаем все входы как CSV и merge по event_id через sample_submit --
+sol154_df = pd.read_csv(SOL154_BLEND_PATH)
+print(f"Loaded sol_154 blend: {SOL154_BLEND_PATH} ({len(sol154_df):,} rows)")
+
+# Собираем все наши submissions (уже сохранены выше) + sol154
+mega_sub_sources = {
+    "catboost":   SUBMISSION_DIR / "submission_cb.csv",
+    "lightgbm":   SUBMISSION_DIR / "submission_lgb.csv",
+    "xgboost":    SUBMISSION_DIR / "submission_xgb.csv",
+    "extratrees": SUBMISSION_DIR / "submission_et.csv",
+    "mlp":        SUBMISSION_DIR / "submission_mlp.csv",
+    f"my_best_blend ({best_combo_name})": SUBMISSION_DIR / f"submission_blend_{best_combo_name}.csv",
+}
+
+# Базовый фрейм — event_id из sample_submit (гарантированный формат)
+mega_df = sample_submit[["event_id"]].copy()
+
+# Присоединяем наши 6 submissions
+for label, path in mega_sub_sources.items():
+    sub = pd.read_csv(path)
+    mega_df = mega_df.merge(sub.rename(columns={"predict": label}), on="event_id", how="left")
+    n_miss = int(mega_df[label].isna().sum())
+    print(f"  {label:40s}: loaded {len(sub):,} rows, missing after merge: {n_miss}")
+
+# Присоединяем sol_154
+mega_df = mega_df.merge(
+    sol154_df.rename(columns={"predict": "sol154"}), on="event_id", how="left"
+)
+n_miss_sol = int(mega_df["sol154"].isna().sum())
+print(f"  {'sol154':40s}: loaded {len(sol154_df):,} rows, missing after merge: {n_miss_sol}")
+
+# Собираем массивы предсказаний
+mega_names = list(mega_sub_sources.keys()) + ["sol154"]
+mega_inputs = {}
+for name in mega_names:
+    vals = mega_df[name].values.astype(np.float64)
+    n_nan = int(np.isnan(vals).sum())
+    if n_nan > 0:
+        med = np.nanmedian(vals)
+        print(f"  WARNING: {name} has {n_nan} NaN, filling with median={med:.6f}")
+        vals = np.where(np.isnan(vals), med, vals)
+    mega_inputs[name] = vals
+
+# -- Веса: пропорциональны val PR-AUC для наших моделей --
+val_scores = {
+    "catboost": ap_cb,
+    "lightgbm": ap_lgb,
+    "xgboost": ap_xgb,
+    "extratrees": ap_et,
+    "mlp": ap_mlp,
+}
+best_blend_label = f"my_best_blend ({best_combo_name})"
+
+# Нормализация: сумма весов 5 моделей = 1.0, бленд = 1.0, sol154 = 1.0 → итого ~3 группы
+sum_val = sum(val_scores.values())
+mega_weights = {}
+for name, score in val_scores.items():
+    mega_weights[name] = score / sum_val  # пропорционально val AP, сумма = 1.0
+mega_weights[best_blend_label] = 1.0      # столько же, сколько все 5 моделей вместе
+mega_weights["sol154"] = 1.0              # столько же
+
+print("\nMega-ensemble weights (before normalization):")
+total_w = sum(mega_weights.values())
+for name, w in mega_weights.items():
+    print(f"  {name:40s}: {w:.4f}  ({w / total_w * 100:.1f}%)")
+
+# -- Корреляция Спирмена между входами (диагностика) --
+from scipy.stats import spearmanr
+print("\nSpearman rank correlations (pairwise):")
+for i in range(len(mega_names)):
+    for j in range(i + 1, len(mega_names)):
+        r, _ = spearmanr(mega_inputs[mega_names[i]], mega_inputs[mega_names[j]])
+        print(f"  {mega_names[i]:30s} vs {mega_names[j]:30s}: {r:.4f}")
+
+# -- Стратегия A: sol154 + только diverse модели (ET, MLP, CB — низкая корреляция с sol154) --
+# Убираем my_best_blend (corr=0.997 с LGB — дубликат) и LGB/XGB (corr>0.83 с sol154)
+diverse_inputs = {k: mega_inputs[k] for k in ["catboost", "extratrees", "mlp", "sol154"]}
+
+# -- Стратегия B: sol154 + наш лучший бленд (простой 2-way blend) --
+two_way_inputs = {best_blend_label: mega_inputs[best_blend_label], "sol154": mega_inputs["sol154"]}
+
+# -- Стратегия C: sol154 + все 5 моделей (без дублирующего бленда) --
+no_blend_inputs = {k: mega_inputs[k] for k in ["catboost", "lightgbm", "xgboost", "extratrees", "mlp", "sol154"]}
+
+STRATEGIES = {
+    "diverse": (diverse_inputs, {"catboost": 1.0, "extratrees": 1.0, "mlp": 1.0, "sol154": 1.0}),
+    "2way":    (two_way_inputs, {best_blend_label: 1.0, "sol154": 1.0}),
+    "5models": (no_blend_inputs, {"catboost": 1.0, "lightgbm": 1.0, "xgboost": 1.0, "extratrees": 1.0, "mlp": 1.0, "sol154": 1.0}),
+}
+
+SOL154_GRID = [0.55, 0.65, 0.75, 0.85, 0.90, 0.95]
+
+print(f"\nGenerating mega-ensemble grid ({len(STRATEGIES)} strategies x {len(SOL154_GRID)} weights):")
+for strat_name, (strat_inputs, base_weights) in STRATEGIES.items():
+    my_keys = [k for k in base_weights if k != "sol154"]
+    my_base_total = sum(base_weights[k] for k in my_keys)
+    for sol_share in SOL154_GRID:
+        my_share = 1.0 - sol_share
+        grid_w = {k: my_share * (base_weights[k] / my_base_total) for k in my_keys}
+        grid_w["sol154"] = sol_share
+
+        pred = mega_logit_zscore_blend(strat_inputs, grid_w, eps=1e-7)
+        tag = f"mega_{strat_name}_sol{int(sol_share * 100)}"
+        out = mega_df[["event_id"]].copy()
+        out["predict"] = pred
+        out_path = SUBMISSION_DIR / f"submission_{tag}.csv"
+        out.to_csv(out_path, index=False)
+        print(f"  {tag:35s} -> {out_path.name}")
